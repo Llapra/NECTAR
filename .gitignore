@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# NECTAR · archivos que NO se suben a GitHub
+# ---------------------------------------------------------------------------
+
+# --- Entornos virtuales de Python -----------------------------------------
+# Cada PC crea el suyo (pesan cientos de MB y dependen de la máquina).
+venv-NECTAR/
+venv*/
+.venv/
+env/
+
+# --- Archivos generados por Python ----------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Sesiones de medición -------------------------------------------------
+# Los datos NUNCA van al repositorio: van al disco de datos / NAS.
+# Carpetas de sesión que crea NECTAR (p. ej. NECTAR_Cupula_20260917_161355
+# o NECTAR_Prueba_20261019_120000_DEMO).
+NECTAR_*_[0-9]*/
+# Formatos de datos crudos y productos pesados, por si quedan sueltos.
+*.raw
+*.bin
+*.mp4
+*.h5
+*.hdf5
+*.npz
+*.tif
+*.tiff
+
+# --- Editores y sistema operativo -----------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
