@@ -62,17 +62,9 @@ class EventRoi:
 
     @property
     def pixel_fraction(self) -> float:
-        """Fracción del sensor que queda activa. Escala la tasa esperada.
-
-        Devuelve 1.0 si el recorte está pedido pero **no** programado en el
-        sensor. Es la diferencia que importa para el presupuesto de disco: un
-        recorte solo visual no baja ni un byte el caudal, porque los píxeles
-        de fuera siguen disparando. Descontarlo sería prometer un archivo más
-        chico del que se va a escribir, y el presupuesto de la pestaña 1 se
-        quedaría corto justo en la toma larga.
-        """
+        """Fracción del sensor que queda activa. Escala la tasa esperada."""
         total = self.sensor_width * self.sensor_height
-        if not total or not self.enabled or not self.applied:
+        if not total or not self.enabled:
             return 1.0
         return max(0.0, min(1.0, (self.width * self.height) / total))
 
@@ -85,17 +77,11 @@ class EventRoi:
             "sensor_alto": self.sensor_height,
             "fraccion_pixeles": round(self.pixel_fraction, 4),
             "aplicado_en_hardware": self.applied,
-            "solo_visual": bool(self.enabled and not self.applied),
             "metodo_hal": self.method,
             "error": self.error,
             "nota_coordenadas": (
                 "Los eventos del .raw conservan coordenadas absolutas del "
                 "sensor completo; el recorte no las desplaza."),
-            "nota_solo_visual": (
-                "ATENCION: el recorte no se programó en el sensor. Este .raw "
-                "contiene el CUADRO COMPLETO; el rectángulo de arriba fue "
-                "solo una ayuda de encuadre en la pantalla."
-                if (self.enabled and not self.applied) else ""),
         }
 
 

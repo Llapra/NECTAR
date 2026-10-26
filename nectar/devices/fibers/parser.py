@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from . import protocol
+from ... import config
 
 
 @dataclass
@@ -38,11 +39,15 @@ class ChannelState:
     minimum: float = float("inf")
     maximum: float = float("-inf")
     _sum: float = 0.0
+    valid_samples: int = 0
 
     def update(self, value: float, host_ns: int) -> None:
         self.last_value = value
         self.last_host_ns = host_ns
         self.samples += 1
+        if not np.isfinite(value):
+            return
+        self.valid_samples += 1
         self._sum += value
         if value < self.minimum:
             self.minimum = value
@@ -51,7 +56,7 @@ class ChannelState:
 
     @property
     def mean(self) -> float:
-        return self._sum / self.samples if self.samples else float("nan")
+        return self._sum / self.valid_samples if self.valid_samples else float("nan")
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -91,13 +96,17 @@ class FiberParser:
         while len(self._buffer) >= size:
             slot, _pad1, channel, _pad2, value = protocol.PACKET.unpack_from(
                 self._buffer, 0)
-            del self._buffer[:size]
 
             # Un slot 0 o un canal fuera de rango significa desalineación:
             # se descarta un byte y se vuelve a probar.
-            if slot < 1 or channel < 1 or channel > 2 or slot > 64:
+            if slot < 1 or channel < 1 or channel > 2 or slot > config.FIBER_MAX_MODULES:
+                del self._buffer[:1]
                 self.malformed += 1
                 continue
+            del self._buffer[:size]
+            # Código observado en los canales sin temperatura del CoreSens2.
+            if value == 65535.0 or not np.isfinite(value):
+                value = float("nan")
 
             index = protocol.channel_index(slot, channel)
             state = self.channels.get(index)

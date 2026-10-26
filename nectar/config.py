@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "NECTAR"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 APP_SUBTITLE = "Neuromorphic & Emergent Camera Tomography for Atmospheric Research"
 
 # ---------------------------------------------------------------------------
@@ -77,11 +77,7 @@ EVENT_BIAS_RANGES = {
 
 EVENT_ACCUM_US_DEFAULT = 10000      # ventana de integración Δt
 EVENT_ACCUM_US_RANGE = (200, 100000)
-#: Cuadros por segundo de la **pantalla**, no de la adquisición: el flujo de
-#: eventos no se toca, esto solo decide cada cuánto se pinta una imagen. 60
-#: es el valor del visor anterior del laboratorio, y es el que hace que el
-#: movimiento se vea continuo al enfocar a mano.
-EVENT_DISPLAY_FPS_DEFAULT = 60
+EVENT_DISPLAY_FPS_DEFAULT = 30
 EVENT_DISPLAY_FPS_RANGE = (1, 200)
 EVENT_SENSOR_SIZE = (640, 480)      # se corrige al conectar con el HAL real
 EVENT_SYNC_MODES = ["STANDALONE", "MASTER", "SLAVE"]
@@ -129,13 +125,13 @@ EMERGENT_WRITE_BATCH = 32
 # Fibras ópticas (Opsens CoreSens)
 # ---------------------------------------------------------------------------
 #: El controlador expone un canal de control (SCPI en ASCII) y otro de datos.
-FIBER_DEFAULT_IP = "192.168.1.50"
-FIBER_CONTROL_PORT = 50910
-FIBER_DATA_PORT = 50911
+FIBER_DEFAULT_IP = "10.0.10.2"
+FIBER_CONTROL_PORT = 2001
+FIBER_DATA_PORT = 2003
 #: Paquete de datos: [slot][relleno][canal][relleno][float32 little-endian]
 FIBER_PACKET_SIZE = 8
 #: Módulos de doble canal por chasis (hasta 13 en el rack de 4U).
-FIBER_MAX_MODULES = 13
+FIBER_MAX_MODULES = 3
 FIBER_CHANNELS_PER_MODULE = 2
 #: Tasas de muestreo admitidas. Del datasheet IMP0160 CoreSens Rev3.8:
 #: módulo WLX-2 hasta 500 Hz; WLX-2S y GSX-2 hasta 1000 Hz por canal.

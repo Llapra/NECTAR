@@ -9,9 +9,8 @@ un canal de control en comandos tipo SCPI y otro canal por donde llegan las
 muestras en binario.
 
 Por eso la unidad que se "agrega" en esta pestaña es el acondicionador, y cada
-fibra es un canal dentro de él. La lista desplegable de fibras numeradas
-aparece dentro del panel del equipo, y se arma sola: el programa no pregunta
-cuántas fibras hay, las descubre según qué (módulo, canal) están publicando.
+fibra es un canal dentro de él. El panel presenta seis filas desde la conexión,
+y las actualiza según qué (módulo, canal) están publicando.
 Si hay más de un acondicionador, se agregan más equipos y la lógica aditiva
 funciona igual en los dos niveles.
 
@@ -46,7 +45,7 @@ from PyQt6.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QLabel,
                              QWidget)
 
 from ... import config
-from ...devices.base import DeviceWorker
+from ...devices.base import DeviceState, DeviceWorker
 from ...devices.fibers import worker as fiber_worker
 from ...devices.fibers import protocol
 from .. import theme
@@ -87,6 +86,8 @@ class FiberChannelRow(QWidget):
         layout.addStretch(1)
         layout.addWidget(self.extremes)
         layout.addWidget(self.rate)
+        self.status = QLabel("Esperando datos")
+        layout.addWidget(self.status)
         layout.addWidget(self.value)
 
     def update_values(self, data: Dict[str, Any]) -> None:
@@ -96,6 +97,7 @@ class FiberChannelRow(QWidget):
         else:
             self.value.setText(f"{value:.3f} °C")
         self.rate.setText(f"{data.get('hz', 0):.0f} Hz")
+        self.status.setText(str(data.get("estado", "Esperando datos")))
         low, high = data.get("min"), data.get("max")
         if low is not None and high is not None:
             self.extremes.setText(f"[{low:.2f} … {high:.2f}]")
@@ -125,10 +127,16 @@ class FiberPanel(DevicePanel):
         self.channel_box = Section("Fibras detectadas")
         layout.addWidget(self.channel_box)
         self._rows: Dict[int, FiberChannelRow] = {}
+        for index in range(6):
+            slot, channel = protocol.slot_channel(index)
+            row = FiberChannelRow(index, protocol.channel_label(slot, channel))
+            self._rows[index] = row
+            self.channel_box.add(row)
 
         # --- curvas y barras -------------------------------------------
         self.plot = TimeSeriesPlot(y_label="temperatura (°C)", capacity=1200)
         self.plot.setMinimumHeight(220)
+        self.plot.set_series([row.name.text() for row in self._rows.values()])
         layout.addWidget(self.plot, 1)
 
         self.bars = BarPlot(y_label="°C")
@@ -146,14 +154,15 @@ class FiberPanel(DevicePanel):
         grid.addWidget(self.row_samples, 1, 1)
         layout.addLayout(grid)
 
-        self._last_numeric_update = 0.0
         self._t_start = time.perf_counter()
 
     # ------------------------------------------------------------------
     def refresh_stats(self, stats: Dict[str, Any]) -> None:
         channels: List[Dict[str, Any]] = stats.get("canales") or []
 
-        self.lbl_channels.setText(f"{len(channels)} fibras")
+        valid = sum(data.get("valor") is not None and np.isfinite(data["valor"])
+                    for data in channels)
+        self.lbl_channels.setText(f"{valid}/6 con temperatura · {len(channels)} canales recibidos")
         self.lbl_rate.setText(f"{stats.get('tasa_hz', 0)} Hz")
         self.lbl_flow.setText(f"{stats.get('kb_s', 0):.1f} KB/s")
         self.row_samples.set_value(f"{stats.get('muestras_totales', 0):,}")
@@ -172,33 +181,33 @@ class FiberPanel(DevicePanel):
         # La cifra visible se refresca una vez por segundo: a 1 kHz los
         # dígitos serían ilegibles y no le sirven a nadie.
         now = time.perf_counter()
-        if now - self._last_numeric_update >= 1.0:
-            self._last_numeric_update = now
-            for data in channels:
-                row = self._rows.get(int(data["indice"]))
-                if row is not None:
-                    row.update_values(data)
+        # Instantánea recibida a 1 Hz desde el worker.
+        for data in channels:
+            row = self._rows.get(int(data["indice"]))
+            if row is not None:
+                row.update_values(data)
 
-            values = {}
-            labels, numbers = [], []
-            for data in channels:
-                row = self._rows.get(int(data["indice"]))
-                if row is None:
-                    continue
-                value = data.get("valor")
-                if value is None or not np.isfinite(value):
-                    continue
-                values[row.name.text()] = value
-                labels.append(f"F{int(data['indice']) + 1}")
-                numbers.append(value)
-            if values:
-                self.plot.append_many(now - self._t_start, values)
-            if labels:
-                self.bars.set_values(labels, numbers)
+        values = {}
+        labels, numbers = [], []
+        for data in channels:
+            row = self._rows.get(int(data["indice"]))
+            if row is None:
+                continue
+            value = data.get("valor")
+            if value is None or not np.isfinite(value):
+                continue
+            values[row.name.text()] = value
+            labels.append(f"F{int(data['indice']) + 1}")
+            numbers.append(value)
+        if values:
+            self.plot.append_many(now - self._t_start, values)
+        self.bars.set_values(labels, numbers)
 
         mean = stats.get("temp_media_c")
         self.row_mean.set_value(f"{mean:.3f} °C" if mean is not None else "—")
         structure = stats.get("estructura") or {}
+        self.row_spread.set_value("—")
+        self.row_struct.set_value("—")
         if structure:
             self.row_spread.set_value(
                 f"{structure.get('rango_C', 0):.3f} °C")
@@ -206,17 +215,23 @@ class FiberPanel(DevicePanel):
             if lag1 is not None:
                 self.row_struct.set_value(f"{lag1:.5f} °C²")
 
+    def refresh_state(self) -> None:
+        super().refresh_state()
+        if hasattr(self, "_rows") and self.worker.state not in (
+                DeviceState.STREAMING, DeviceState.ARMED, DeviceState.RECORDING):
+            for row in self._rows.values():
+                row.update_values(dict(valor=None, hz=0, estado="Sin conexión"))
+
 
 class FibersTab(FamilyTab):
     """Pestaña de las fibras ópticas."""
 
     family = "fibers"
     family_label = "Fibras"
-    empty_message = ("No hay acondicionadores de fibra conectados.\n\n"
-                     "El equipo se declara por IP (no se autodescubre): pulsa "
-                     "DETECTAR para ver la entrada del laboratorio y la "
-                     "unidad simulada, ajusta la IP en el panel lateral si "
-                     "hace falta, y AGREGAR FIBRAS.")
+    empty_message = ("Conecta el CoreSens2 en 10.0.10.2.\n\n"
+                     "Pulsa CONECTAR para visualizar hasta seis fibras. "
+                     "Las temperaturas se actualizan cada segundo. "
+                     "No se guardan mediciones hasta pulsar GRABAR.")
     side_width: int = 330
 
     def create_panel(self, worker: DeviceWorker) -> DevicePanel:
@@ -248,6 +263,13 @@ class FibersTab(FamilyTab):
         ports.addWidget(QLabel("Datos:"))
         ports.addWidget(self.spin_data)
         connection.add_layout(ports)
+        self.btn_connect = QPushButton("CONECTAR")
+        self.btn_connect.clicked.connect(self._connect_target)
+        connection.add(self.btn_connect)
+        note = QLabel("Vista en vivo cada 1 s, sin guardar. La frecuencia de "
+                      "muestreo se configura por separado abajo.")
+        note.setWordWrap(True)
+        connection.add(note)
         layout.addWidget(connection)
 
         rates = Section("Frecuencia de captación")
@@ -269,11 +291,10 @@ class FibersTab(FamilyTab):
         self.spin_force.setRange(1, 5000)
         self.spin_force.setValue(1000)
         self.spin_force.setSuffix(" Hz")
-        self.btn_force = QPushButton("Forzar")
+        self.btn_force = QPushButton("Aplicar valor")
         self.btn_force.setToolTip(
-            "Intenta una frecuencia arbitraria. Si excede el máximo del "
-            "módulo se recorta al valor legal más cercano y queda avisado "
-            "en el registro.")
+            "Ajusta el valor a la lista del módulo. La frecuencia se consulta "
+            "al conversor después de enviarla y se confirma en el registro.")
         self.btn_force.clicked.connect(self._on_force_rate)
         force.addWidget(self.spin_force)
         force.addWidget(self.btn_force)
@@ -335,7 +356,15 @@ class FibersTab(FamilyTab):
             self.console.log(warning)
         for worker in self.workers():
             worker.set_sampling_rate(requested)
-        self.console.log(f"Frecuencia aplicada: {valid} Hz.")
+        self.console.log(f"Frecuencia solicitada: {valid} Hz; se confirmará con el equipo.")
+
+    def _connect_target(self) -> None:
+        ip = self.txt_ip.text().strip()
+        if any(worker.ip == ip for worker in self.workers()):
+            self.console.log(f"Ya hay un equipo agregado en {ip}.")
+            return
+        self.add_device(dict(id=f"fibers_{ip}", label="Fibras_01", ip=ip,
+                             simulated=False))
 
     # ------------------------------------------------------------------
     def detect(self) -> None:

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout,
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayout,
                              QLabel, QPushButton, QVBoxLayout, QWidget)
 
 from ...devices.base import DeviceWorker
@@ -244,6 +244,11 @@ class EmergentTab(FamilyTab):
         layout.addWidget(params, 1)
 
         preview = Section("Vista previa")
+        self.cmb_preview_fps = QComboBox()
+        self.cmb_preview_fps.addItems(["30", "20"])
+        self.cmb_preview_fps.currentTextChanged.connect(self._on_preview_fps)
+        preview.add(LabeledControl("FPS de visualización", self.cmb_preview_fps,
+                                   "Solo cambia la vista previa, no la captura ni la grabación."))
         self.ctl_preview_step = SliderSpin(1, 8, 2)
         self.ctl_preview_step.value_changed.connect(self._on_preview_step)
         preview.add(LabeledControl(
@@ -252,7 +257,10 @@ class EmergentTab(FamilyTab):
             "antes de convertir es lo que mantiene la vista previa barata; no "
             "afecta a lo que se graba."))
         self.chk_contrast = QCheckBox("Estirar contraste (percentiles 1–99)")
-        self.chk_contrast.setChecked(True)
+        self.chk_contrast.setChecked(False)
+        self.chk_contrast.setToolTip(
+            "Puede ocultar cambios de ganancia y exposición al reajustar el brillo "
+            "de cada imagen. Desactivado muestra una escala fija del sensor.")
         self.chk_contrast.toggled.connect(self._on_contrast)
         preview.add(self.chk_contrast)
         self.row_total = preview.add_row("Cámaras conectadas", "0")
@@ -264,6 +272,8 @@ class EmergentTab(FamilyTab):
     def on_device_added(self, worker: DeviceWorker, panel: DevicePanel) -> None:
         worker.preview_step = self.ctl_preview_step.value()
         worker.auto_contrast = self.chk_contrast.isChecked()
+        worker.display_fps = int(self.cmb_preview_fps.currentText())
+        worker.hub.set_display_fps(worker.display_fps)
         worker.info_ready.connect(self._on_info)
         self._refresh_active_combo()
 
@@ -347,7 +357,27 @@ class EmergentTab(FamilyTab):
             maximum = int(entry.get("maximum", max(minimum + 1, 1)))
             step = int(entry.get("increment", 1) or 1)
             value = int(entry.get("value", minimum))
-            control = SliderSpin(minimum, maximum, value, step=step)
+            if maximum > 2147483647:
+                # QSlider/QSpinBox solo admiten enteros con signo de 32 bits.
+                control = QDoubleSpinBox()
+                control.setDecimals(0)
+                control.setRange(minimum, maximum)
+                control.setSingleStep(step)
+                control.setValue(value)
+                control.setKeyboardTracking(False)
+
+                def commit(new_value):
+                    valid = minimum + ((int(new_value) - minimum) // step) * step
+                    control.blockSignals(True)
+                    control.setValue(valid)
+                    control.blockSignals(False)
+                    self._apply_param(name, valid)
+
+                control.valueChanged.connect(commit)
+                return control
+            control = SliderSpin(minimum, maximum, value, step=step, snap_to_step=True)
+            control.spin.setKeyboardTracking(False)
+            control.slider.setTracking(False)
             control.value_changed.connect(
                 lambda new_value, key=name: self._apply_param(key, new_value))
             return control
@@ -389,6 +419,11 @@ class EmergentTab(FamilyTab):
     def _on_preview_step(self, value: int) -> None:
         for worker in self.workers():
             worker.preview_step = int(value)
+
+    def _on_preview_fps(self, text: str) -> None:
+        for worker in self.workers():
+            worker.display_fps = int(text)
+            worker.hub.set_display_fps(worker.display_fps)
 
     def _on_contrast(self, checked: bool) -> None:
         for worker in self.workers():

@@ -88,75 +88,121 @@ def find_sdk_dir() -> Optional[Path]:
     return None
 
 
-#: Paquetes de pip que el SDK necesita por dentro y que NECTAR no usa
-#: directamente. Van acá porque su ausencia se manifiesta como un
-#: ``ModuleNotFoundError`` dentro del SDK, que es muy fácil de leer como "no
-#: está el SDK" cuando el SDK sí está.
-DEPENDENCIAS_DEL_SDK = {
-    "h5py": ("metavision_core.event_io lo importa para leer y escribir "
-             "archivos HDF5 de eventos"),
-    "scipy": "varios módulos de metavision_core lo usan para filtrado",
-    "cv2": ("algunos módulos del SDK lo usan para mostrar imágenes "
-            "(paquete de pip: opencv-python)"),
-    "pandas": "metavision_core lo usa para los resúmenes de eventos",
-}
-
-#: Nombre del módulo → nombre del paquete de pip, cuando no coinciden.
-PAQUETE_PIP = {"cv2": "opencv-python"}
-
-
 def _try_import() -> Tuple[bool, str]:
-    """Importa los dos módulos del SDK **por separado**.
-
-    La versión anterior los importaba juntos en un mismo ``try``, así que
-    cualquier fallo producía el mismo mensaje genérico. Eso costó una sesión
-    entera de depuración: faltaba ``h5py`` —una dependencia interna de
-    ``metavision_core.event_io``, no de NECTAR— y el programa informaba "el
-    SDK de Metavision no está disponible" con el SDK perfectamente instalado.
-
-    Ahora cada módulo se reporta por su nombre y el error se devuelve tal
-    como vino, para que ``diagnose()`` pueda distinguir los casos.
-    """
-    fallos = []
-    for nombre in ("metavision_hal", "metavision_core.event_io"):
-        try:
-            __import__(nombre)
-        except Exception as exc:
-            fallos.append(f"{nombre}: {type(exc).__name__}: {exc}")
-    if not fallos:
+    try:
+        import metavision_core.event_io          # noqa: F401
+        import metavision_hal                    # noqa: F401
         return True, ""
-    return False, " | ".join(fallos)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
-def _missing_dependency(error: str) -> Optional[str]:
-    """Módulo faltante que el error delata, si es una dependencia del SDK.
+def _missing_dependency() -> Optional[str]:
+    """Paquete de pip que le falta al SDK, o ``None``.
 
-    Busca el nombre entre comillas de un ``ModuleNotFoundError``. Si el módulo
-    que falta es uno de los que el SDK necesita por dentro, lo devuelve; si el
-    que falta es el propio SDK, no, porque ése es un caso distinto.
+    El SDK puede estar en el camino y aun así no importar porque uno de sus
+    propios imports no está en el entorno (``metavision_core.event_io`` importa
+    ``h5py``, por ejemplo). Ese caso no tiene nada que ver con rutas ni con la
+    versión de Python, y se arregla con un ``pip install``.
     """
-    if "ModuleNotFoundError" not in error and "No module named" not in error:
-        return None
-    for nombre in DEPENDENCIAS_DEL_SDK:
-        if f"'{nombre}'" in error or f"named {nombre}" in error:
-            return nombre
+    try:
+        import metavision_core.event_io          # noqa: F401
+        import metavision_hal                    # noqa: F401
+    except ModuleNotFoundError as exc:
+        name = (exc.name or "").split(".")[0]
+        if name and not name.startswith("metavision"):
+            return name
+    except Exception:
+        pass
     return None
 
 
-def dependency_hint(error: str) -> str:
-    """Instrucción concreta para una dependencia interna del SDK que falta."""
-    modulo = _missing_dependency(error)
-    if modulo is None:
-        return ""
-    paquete = PAQUETE_PIP.get(modulo, modulo)
-    motivo = DEPENDENCIAS_DEL_SDK[modulo]
-    return (
-        f"El SDK de Metavision **sí está instalado y visible**, pero le falta "
-        f"una dependencia interna: el módulo '{modulo}'.\n"
-        f"No es un paquete de NECTAR: {motivo}.\n"
-        f"Con el entorno virtual activado:\n"
-        f"    pip install {paquete}\n"
-        f"y vuelve a arrancar el programa.")
+def plugin_dirs() -> List[Path]:
+    """Carpetas de plugins del HAL de terceros (CenturyArks · SilkyEvCam)."""
+    if sys.platform.startswith("win"):
+        bases = [r"C:\Program Files\CenturyArks\plugins",
+                 r"C:\Program Files (x86)\CenturyArks\plugins"]
+    else:
+        bases = ["/usr/lib/CenturyArks/hal/plugins",
+                 "/usr/local/lib/CenturyArks/hal/plugins"]
+    return [Path(base) for base in bases]
+
+
+def ensure_plugin_path() -> List[Path]:
+    """Agrega a ``MV_HAL_PLUGIN_PATH`` los plugins instalados que falten.
+
+    El HAL solo trae los plugins de Prophesee; el de la SilkyEvCam lo busca en
+    ``MV_HAL_PLUGIN_PATH``. Si el programa se lanza desde un proceso que no
+    heredó esa variable (un IDE abierto antes de instalar el plugin, un acceso
+    directo, una terminal vieja), ``DeviceDiscovery`` devuelve una lista vacía
+    sin ningún error, aunque ``metavision_viewer`` vea la cámara. Devuelve las
+    carpetas que se agregaron.
+    """
+    current = [p for p in os.environ.get("MV_HAL_PLUGIN_PATH", "").split(os.pathsep)
+               if p.strip()]
+    known = {os.path.normcase(os.path.normpath(p)) for p in current}
+    added: List[Path] = []
+    for path in plugin_dirs():
+        try:
+            if not path.is_dir():
+                continue
+        except OSError:
+            continue
+        if os.path.normcase(os.path.normpath(str(path))) not in known:
+            current.append(str(path))
+            added.append(path)
+    if added:
+        os.environ["MV_HAL_PLUGIN_PATH"] = os.pathsep.join(current)
+    return added
+
+
+def dll_dirs() -> List[Path]:
+    """Carpetas con las DLL del SDK y de los plugins (solo Windows)."""
+    if not sys.platform.startswith("win"):
+        return []
+    dirs: List[Path] = []
+    for base in (r"C:\Program Files\Prophesee", r"C:\Program Files\Metavision",
+                 r"C:\Prophesee"):
+        dirs.append(Path(base) / "bin")
+        dirs.append(Path(base) / "third_party" / "bin")
+    dirs.append(Path(r"C:\Program Files\CenturyArks\bin"))
+    return dirs
+
+
+#: Cookies de add_dll_directory: si se liberan, Windows quita la carpeta.
+_dll_directory_cookies: list = []
+
+
+def ensure_dll_path() -> List[Path]:
+    """Agrega al ``PATH`` del proceso las carpetas de DLL del SDK que falten.
+
+    El HAL carga los plugins con ``LoadLibrary``, que resuelve sus
+    dependencias (libusb, boost, las DLL de Metavision) por el ``PATH``. Un
+    proceso abierto antes de instalar Metavision —típicamente la terminal de
+    un VS Code que lleva días abierto— hereda un ``PATH`` sin esas carpetas: el
+    plugin de la SilkyEvCam no carga, el HAL dice "no plugin found" y la lista
+    de cámaras sale vacía sin ningún error. Devuelve las carpetas agregadas.
+    """
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    known = {os.path.normcase(os.path.normpath(p)) for p in current}
+    added: List[Path] = []
+    for path in dll_dirs():
+        try:
+            if not path.is_dir():
+                continue
+        except OSError:
+            continue
+        if hasattr(os, "add_dll_directory"):
+            try:
+                _dll_directory_cookies.append(os.add_dll_directory(str(path)))
+            except OSError:
+                pass
+        if os.path.normcase(os.path.normpath(str(path))) not in known:
+            current.append(str(path))
+            added.append(path)
+    if added:
+        os.environ["PATH"] = os.pathsep.join(current)
+    return added
 
 
 def ensure_on_path() -> Tuple[bool, str, Optional[Path]]:
@@ -164,6 +210,10 @@ def ensure_on_path() -> Tuple[bool, str, Optional[Path]]:
 
     ``carpeta_añadida`` es ``None`` cuando el import funcionaba ya de por sí.
     """
+    # Antes de importar: el HAL lee MV_HAL_PLUGIN_PATH al buscar cámaras, y
+    # los plugins necesitan las DLL del SDK en el PATH para cargar.
+    ensure_plugin_path()
+    ensure_dll_path()
     ok, error = _try_import()
     if ok:
         return True, "", None
@@ -185,14 +235,9 @@ def ensure_on_path() -> Tuple[bool, str, Optional[Path]]:
 def diagnose() -> str:
     """Explicación en castellano de por qué el SDK no está disponible.
 
-    Distingue los cuatro casos que en la práctica se confunden:
-
-    1. el SDK no está instalado;
-    2. está instalado pero este intérprete no lo ve (el caso del entorno
-       virtual sin acceso a los paquetes del sistema);
-    3. está instalado y visible pero le falta una dependencia interna, por
-       ejemplo ``h5py`` — el caso que hizo perder una sesión entera;
-    4. está instalado y visible pero compilado para otra versión de Python.
+    Distingue los tres casos que en la práctica se confunden: el SDK no está
+    instalado, está instalado pero este intérprete no lo ve, y está instalado y
+    visible pero compilado para otra versión de Python.
     """
     ok, error, added = ensure_on_path()
     if ok and added is not None:
@@ -200,12 +245,6 @@ def diagnose() -> str:
                 f"camino de este intérprete.")
     if ok:
         return "SDK de Metavision disponible."
-
-    # Caso 3 antes que los demás: si lo que falta es una dependencia interna,
-    # hablar de rutas y de entornos virtuales solo desorienta.
-    pista = dependency_hint(error)
-    if pista:
-        return f"{pista}\nIntérprete: {sys.executable}\nError: {error}"
 
     sdk_dir = find_sdk_dir()
     interpreter = sys.executable
@@ -228,15 +267,23 @@ def diagnose() -> str:
         f"Intérprete: {interpreter}",
         f"Error: {error}",
     ]
-    if venv:
+    missing = _missing_dependency()
+    if missing:
+        mensaje.append(
+            f"El SDK se encuentra bien; lo que falta es «{missing}», una "
+            f"librería de Python que el propio SDK importa. Instálala en este "
+            f"entorno y vuelve a arrancar el programa:\n"
+            f"    \"{interpreter}\" -m pip install {missing}")
+    elif venv:
         site = (Path(sys.prefix) / "lib" / _python_tag() / "site-packages")
         mensaje.append(
             "Estás en un entorno virtual creado sin acceso a los paquetes del "
             "sistema, que es la causa habitual. La solución menos invasiva es "
             "añadir la carpeta del SDK al entorno con un archivo .pth:\n"
             f"    echo {sdk_dir} > {site}/metavision.pth\n"
-            "y volver a arrancar el programa. (Lo mismo, y todo lo demás, "
-            "lo hace: bash instalar_venv.sh)")
+            "y volver a arrancar el programa. (La alternativa es rehacer el "
+            "entorno con: python3 -m venv --system-site-packages .venv, pero "
+            "eso obliga a reinstalar las dependencias.)")
     else:
         mensaje.append(
             "La carpeta existe pero el import falla igual. Suele significar "

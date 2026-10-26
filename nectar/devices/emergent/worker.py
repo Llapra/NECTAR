@@ -148,9 +148,9 @@ class EmergentWorker(DeviceWorker):
         #: lado del hardware produce un error visible; equivocarse hacia el
         #: lado del simulador produce datos falsos que parecen buenos.
         self.simulated = bool(self.descriptor.get("simulated", False))
-        self.display_fps = 10           # la conversión de 1604x1100 no es gratis
+        self.display_fps = 30
         self.preview_step = 2           # decimación espacial de la vista previa
-        self.auto_contrast = True
+        self.auto_contrast = False
         self.buffer_count = config.EMERGENT_BUFFER_COUNT
 
         self.hub = FrameHub(display_fps=self.display_fps)
@@ -158,6 +158,7 @@ class EmergentWorker(DeviceWorker):
         self._context = None
         self._camera = None
         self._geometry: Dict[str, Any] = {}
+        self._stream_has_frame = False
         self._param_cache: List[Dict[str, Any]] = []
 
         self._pending: List[Callable[[], None]] = []
@@ -192,6 +193,11 @@ class EmergentWorker(DeviceWorker):
     # ------------------------------------------------------------------
     # Conexión
     # ------------------------------------------------------------------
+    @property
+    def is_armable(self) -> bool:
+        return (super().is_armable and self._stream_has_frame
+                and self._geometry.get("frame_bytes", 0) > 0)
+
     def connect_device(self) -> bool:
         if self.simulated and not config.simulations_allowed():
             self._fail("Cámara simulada fuera del modo --demo: no se conecta.",
@@ -329,7 +335,15 @@ class EmergentWorker(DeviceWorker):
             if camera is None:
                 return
             if spec["kind"] == "uint32":
-                camera.set_uint32(name, int(value))
+                info = camera.param_info(name)
+                requested = int(value)
+                step = max(1, info.increment)
+                if not (info.minimum <= requested <= info.maximum) or \
+                        (requested - info.minimum) % step:
+                    self._log(f"{name}: valor {requested} inválido; rango "
+                              f"{info.minimum}–{info.maximum}, paso {step}.")
+                    return
+                camera.set_uint32(name, requested)
             elif spec["kind"] == "bool":
                 camera.set_bool(name, bool(value))
             elif spec["kind"] == "enum":
@@ -433,6 +447,7 @@ class EmergentWorker(DeviceWorker):
         self._apply_pending()
 
         frames = []
+        self._stream_has_frame = False
         camera.open_stream()
         try:
             for _ in range(self.buffer_count):
@@ -465,6 +480,7 @@ class EmergentWorker(DeviceWorker):
                     pass
                 camera.drain()
         finally:
+            self._stream_has_frame = False
             for frame in frames:
                 try:
                     camera.release_frame(frame)
@@ -487,6 +503,9 @@ class EmergentWorker(DeviceWorker):
         next_temp = window_start + 5.0
 
         while not self.should_stop and not self._restart.is_set():
+            # Los cambios de geometría se atienden después de desmontar;
+            # los controles en vivo deben ejecutarse aunque siga llegando vídeo.
+            self._apply_pending(live_only=True)
             code, frame = camera.get_frame(config.EMERGENT_FRAME_TIMEOUT_MS)
 
             if code != EVT_SUCCESS or frame is None:
@@ -518,6 +537,20 @@ class EmergentWorker(DeviceWorker):
             previous_id = frame_id
 
             raw = frame.buffer_view()
+            # Algunos eSDK dejan bufferSize en cero al reservar y lo completan
+            # únicamente al recibir. El tamaño para grabar sale del frame real.
+            if raw.size <= 0:
+                camera.queue_frame(frame)
+                continue
+            if not self._stream_has_frame:
+                self._geometry.update(
+                    width=frame.width, height=frame.height, stride=frame.stride,
+                    pixel_format=frame.pixel_format,
+                    pixel_format_name=getattr(frame.pixel_format, "name", str(frame.pixel_format)),
+                    frame_bytes=int(raw.nbytes))
+                self._stream_has_frame = True
+                self._log(f"Flujo confirmado: {frame.width}x{frame.height}, "
+                          f"{raw.nbytes} bytes/frame; lista para armar.")
 
             # --- grabación: un solo memcpy al anillo -------------------
             if self._recording and self._writer is not None:
@@ -555,10 +588,10 @@ class EmergentWorker(DeviceWorker):
                 window_frames = 0
                 next_stats = now + config.STATS_PERIOD_S
 
-        self._apply_pending()
-
-    def _apply_pending(self) -> None:
+    def _apply_pending(self, live_only: bool = False) -> None:
         with self._pending_lock:
+            if live_only and self._restart.is_set():
+                return
             actions, self._pending = self._pending, []
         for action in actions:
             try:

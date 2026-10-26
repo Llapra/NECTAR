@@ -535,6 +535,11 @@ class AcquisitionTab(QWidget):
         cell = self.previews.cell_for(getattr(worker, "device_id", ""))
         if cell is not None:
             cell.set_image(image)
+        # Acuse de recibo: los workers con contrapresión esperan a que alguna
+        # vista termine de pintar antes de mandar el cuadro siguiente.
+        hub = getattr(worker, "hub", None)
+        if hub is not None:
+            hub.acknowledge()
 
     def _on_alias_changed(self, device_id: str, alias: str) -> None:
         self.manager.rename(device_id, alias)

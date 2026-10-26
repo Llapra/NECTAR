@@ -33,8 +33,9 @@ class SliderSpin(QWidget):
 
     def __init__(self, minimum: int, maximum: int, value: int,
                  step: int = 1, suffix: str = "",
-                 parent: Optional[QWidget] = None) -> None:
+                 parent: Optional[QWidget] = None, snap_to_step: bool = False) -> None:
         super().__init__(parent)
+        self._snap_to_step = snap_to_step
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -59,6 +60,9 @@ class SliderSpin(QWidget):
         layout.addWidget(self.spin, 0)
 
     def _from_slider(self, value: int) -> None:
+        if self._snap_to_step:
+            value = self._valid_value(value)
+            self.set_value(value)
         if self.spin.value() != value:
             self.spin.blockSignals(True)
             self.spin.setValue(value)
@@ -66,6 +70,9 @@ class SliderSpin(QWidget):
         self.value_changed.emit(value)
 
     def _from_spin(self, value: int) -> None:
+        if self._snap_to_step:
+            value = self._valid_value(value)
+            self.set_value(value)
         if self.slider.value() != value:
             self.slider.blockSignals(True)
             self.slider.setValue(value)
@@ -74,6 +81,12 @@ class SliderSpin(QWidget):
 
     def value(self) -> int:
         return self.spin.value()
+
+    def _valid_value(self, value: int) -> int:
+        minimum = self.spin.minimum()
+        value = max(minimum, min(self.spin.maximum(), int(value)))
+        step = self.spin.singleStep()
+        return minimum + ((value - minimum) // step) * step
 
     def set_value(self, value: int) -> None:
         self.slider.blockSignals(True)

@@ -163,6 +163,7 @@ class FiberWorker(DeviceWorker):
         self.parser = FiberParser()
         self._control: Optional[socket.socket] = None
         self._data: Optional[socket.socket] = None
+        self._control_rx = bytearray()
 
         self._raw_writer: Optional[ByteStreamWriter] = None
         self._csv_handle = None
@@ -172,10 +173,7 @@ class FiberWorker(DeviceWorker):
         self._chunk_started = 0.0
         self._chunk_summaries: List[Dict[str, Any]] = []
         self._rows_written = 0
-        #: Reconstrucción de barridos: valores del instante que se está armando.
-        self._row_values: Dict[int, float] = {}
-        self._last_index = -1
-        self._sweeps = 0
+        self._channel_sample_indices: Dict[int, int] = {}
 
         self._bytes_window = 0
         self._bytes_total = 0
@@ -188,6 +186,9 @@ class FiberWorker(DeviceWorker):
     # ------------------------------------------------------------------
     def set_sampling_rate(self, hz: int) -> None:
         """Pide una tasa; se valida contra el módulo antes de mandarla."""
+        if self._recording or self._armed:
+            self._log("Detén la grabación o cancela el armado antes de cambiar la frecuencia.")
+            return
         valid, warning = protocol.clamp_rate(int(hz), self.module_type)
         self.requested_rate = int(hz)
         if warning:
@@ -246,10 +247,18 @@ class FiberWorker(DeviceWorker):
 
     # ------------------------------------------------------------------
     def _open_sockets(self) -> None:
+        self._control_rx.clear()
         self._control = socket.create_connection((self.ip, self.control_port),
                                                  timeout=3.0)
         self._control.settimeout(0.1)
         self._log(f"Control conectado a {self.ip}:{self.control_port}")
+
+        banner = self._read_response(line=True)
+        if not banner.startswith("Key:"):
+            raise RuntimeError(f"No se recibió la clave CoreSens2: {banner!r}")
+        key = banner.split(":", 1)[1].strip()
+        if not key.isdigit():
+            raise RuntimeError(f"Clave de datos inválida: {banner!r}")
 
         identity = self._ask(protocol.cmd_identify())
         if identity:
@@ -258,15 +267,24 @@ class FiberWorker(DeviceWorker):
         valid, warning = protocol.clamp_rate(self.requested_rate, self.module_type)
         if warning:
             self._log(warning)
-        self._send_control(protocol.cmd_sampling_rate(valid))
-        self._send_control(protocol.cmd_master_rate(valid))
-        self.sampling_rate = valid
-
-        self._send_control(protocol.cmd_start(0))        # infinita
+        self._configure_rate(valid)
+        if self._pending_rate == valid:
+            self._pending_rate = None
 
         self._data = socket.create_connection((self.ip, self.data_port),
                                               timeout=3.0)
         self._data.settimeout(0.2)
+        prompt = bytearray()
+        while len(prompt) < 5:
+            part = self._data.recv(5 - len(prompt))
+            if not part:
+                raise RuntimeError("El canal de datos cerró durante la conexión")
+            prompt.extend(part)
+        if bytes(prompt) != b"Key?:":
+            raise RuntimeError(f"Solicitud de clave inesperada: {bytes(prompt)!r}")
+        self._data.sendall((key + "\n").encode("ascii"))
+        self.parser.reset()
+        self._check_reply(self._ask(protocol.cmd_start(0)))
         self._log(f"Datos conectados a {self.ip}:{self.data_port} "
                   f"a {self.sampling_rate} Hz")
 
@@ -297,27 +315,61 @@ class FiberWorker(DeviceWorker):
     def _ask(self, command: bytes, timeout: float = 0.5) -> str:
         if self._control is None:
             return ""
+        # measure:start publica también el encabezado de canales. Consumir
+        # respuestas pendientes antes de asociar una respuesta al comando.
+        self._control.settimeout(0.02)
+        try:
+            while self._control.recv(4096):
+                pass
+        except socket.timeout:
+            pass
+        finally:
+            self._control.settimeout(0.1)
+        self._control_rx.clear()
         self._send_control(command)
+        return self._read_response(timeout=timeout)
+
+    def _read_response(self, timeout: float = 1.0, line: bool = False) -> str:
         deadline = time.perf_counter() + timeout
-        chunks: List[bytes] = []
+        delimiter = b"\n" if line else b"\x04"
         while time.perf_counter() < deadline:
+            if delimiter in self._control_rx:
+                response, _, remainder = self._control_rx.partition(delimiter)
+                self._control_rx = bytearray(remainder)
+                return response.decode(errors="replace").strip()
             try:
                 data = self._control.recv(4096)
                 if not data:
-                    break
-                chunks.append(data)
-                if b"\n" in data:
-                    break
+                    raise ConnectionError("El conversor cerró el canal de control")
+                self._control_rx.extend(data)
             except socket.timeout:
+                continue
+        raise TimeoutError("El conversor no completó su respuesta")
+
+    @staticmethod
+    def _check_reply(reply: str) -> None:
+        if reply.lower().startswith("err"):
+            raise RuntimeError(f"El conversor rechazó el comando: {reply}")
+
+    def _configure_rate(self, hz: int) -> None:
+        self._check_reply(self._ask(protocol.cmd_rate(hz)))
+        response = self._ask(protocol.cmd_rate_query())
+        # Un ACK/encabezado tardío de measure:start puede preceder a rate?.
+        for _ in range(2):
+            if response and not response.startswith("Sy"):
                 break
-            except OSError:
-                break
-        return b"".join(chunks).decode(errors="replace")
+            response = self._read_response()
+        self._check_reply(response)
+        period = float(response)
+        if not np.isfinite(period) or period <= 0:
+            raise RuntimeError(f"Período de muestreo inválido: {response!r}")
+        self.sampling_rate = int(round(1.0 / period))
+        self._log(f"Frecuencia confirmada por el conversor: {self.sampling_rate} Hz")
 
     # ------------------------------------------------------------------
     def _loop_real(self) -> None:
         window_start = time.perf_counter()
-        next_stats = window_start + config.STATS_PERIOD_S
+        next_stats = window_start + 1.0
 
         while not self.should_stop:
             now = time.perf_counter()
@@ -326,16 +378,15 @@ class FiberWorker(DeviceWorker):
                 rate = self._pending_rate
                 self._pending_rate = None
                 try:
-                    self._send_control(protocol.cmd_sampling_rate(rate))
-                    self._send_control(protocol.cmd_master_rate(rate))
-                    self.sampling_rate = rate
-                    self._log(f"Tasa cambiada a {rate} Hz")
-                except OSError as exc:
+                    self._configure_rate(rate)
+                except (OSError, ValueError, RuntimeError) as exc:
                     self._log(f"No se pudo cambiar la tasa: {exc}")
 
             block = b""
             try:
                 block = self._data.recv(65536) if self._data else b""
+                if not block:
+                    raise RuntimeError("El conversor cerró el canal de datos")
             except socket.timeout:
                 block = b""
             except OSError as exc:
@@ -361,12 +412,12 @@ class FiberWorker(DeviceWorker):
                 self._emit_stats(self._stats_payload())
                 window_start = now
                 self._bytes_window = 0
-                next_stats = now + config.STATS_PERIOD_S
+                next_stats = now + 1.0
 
     def _loop_simulated(self) -> None:
         """Genera temperaturas plausibles: deriva lenta + turbulencia + ruido."""
         window_start = time.perf_counter()
-        next_stats = window_start + config.STATS_PERIOD_S
+        next_stats = window_start + 1.0
         rng = np.random.default_rng(1234)
         base = 14.0 + rng.normal(0.0, 0.4, size=self.sim_channels)
         period = 0.05      # se emiten lotes de 50 ms
@@ -407,7 +458,7 @@ class FiberWorker(DeviceWorker):
                 self._emit_stats(self._stats_payload())
                 window_start = now
                 self._bytes_window = 0
-                next_stats = now + config.STATS_PERIOD_S
+                next_stats = now + 1.0
 
             self._sleep(period)
 
@@ -455,11 +506,10 @@ class FiberWorker(DeviceWorker):
         self._csv_path = directory / f"{stem}.csv"
         self._raw_path = directory / f"{stem}.bin"
 
-        # El encabezado se arma con los canales que ya se descubrieron. Si el
-        # equipo aún no publicó nada, quedan solo las columnas de tiempo: el
-        # binario crudo sigue guardando todo igual.
-        columns = ["host_ns", "t_rel_s", "t_unix", "barrido"]
-        columns.extend(f"ch{state.index + 1}_C" for state in self.parser.ordered())
+        # CoreSens2 entrega lotes por canal, no barridos intercalados.
+        # Formato largo: una fila identifica una muestra de un canal.
+        columns = ["host_ns", "t_rel_s", "t_unix", "muestra", "canal",
+                   "indice_canal", "temperatura_C", "valida"]
         try:
             self._csv_handle = open(self._csv_path, "w", encoding="utf-8",
                                     newline="")
@@ -468,6 +518,8 @@ class FiberWorker(DeviceWorker):
                 self._raw_path,
                 metadata=self.record_metadata(
                     formato="crudo del acondicionador, 8 B por muestra",
+                    formato_csv="muestras_por_canal_v2",
+                    tiempo_csv="recepcion_host_del_bloque_TCP; no timestamp individual del sensor",
                     canales=[state.index + 1 for state in self.parser.ordered()],
                     csv_hermano=self._csv_path.name),
                 t0_ns=self._t0_ns,
@@ -480,25 +532,16 @@ class FiberWorker(DeviceWorker):
 
         self._chunk_started = now
         self._rows_written = 0
-        self._sweeps = 0
-        self._row_values = {}
-        self._last_index = -1
+        self._channel_sample_indices = {}
         self._log(f"Archivo: {self._csv_path.name} "
-                  f"({len(columns) - 4} canal(es))")
+                  "(una muestra por fila, canal explícito)")
         return True
 
     def _record_samples(self, block: bytes, samples, host_ns: int) -> None:
-        """Escribe el crudo tal cual y una fila por *barrido* en el CSV.
+        """Conserva cada muestra y su canal, aunque lleguen lotes agrupados.
 
-        El binario permite re-parsear la sesión si algún día cambia la
-        interpretación; el CSV es el que se usa para trabajar.
-
-        Detalle que importa: el equipo entrega las muestras canal por canal,
-        una tras otra, y un paquete TCP puede traer decenas de barridos
-        completos. Escribir una fila por paquete recibido tiraría a la basura
-        el 98% de las muestras a 1 kHz. Aquí se reconstruye el barrido: cuando
-        el índice de canal deja de crecer, se cerró un instante de muestreo y
-        se escribe su fila.
+        host_ns identifica la recepción TCP. No se inventan tiempos de sensor
+        ni se emparejan como simultáneas muestras de canales distintos.
         """
         if not self._recording:
             return
@@ -507,38 +550,24 @@ class FiberWorker(DeviceWorker):
         if self._csv_handle is None or not samples:
             return
 
+        rows = []
         for index, value, sample_host_ns in samples:
-            if self._row_values and index <= self._last_index:
-                self._flush_row(sample_host_ns)
-            self._row_values[index] = value
-            self._last_index = index
-
-    def _flush_row(self, host_ns: int) -> None:
-        """Vuelca un barrido completo como una fila del CSV."""
-        if self._csv_handle is None or not self._row_values:
-            return
-        t_rel = TIME_BASE.rel_s(host_ns)
-        utc = TIME_BASE.to_utc(host_ns)
-        row = [str(host_ns), f"{t_rel:.6f}",
-               f"{utc:.6f}" if utc is not None else "",
-               str(self._sweeps)]
-        for state in self.parser.ordered():
-            value = self._row_values.get(state.index)
-            row.append(f"{value:.4f}" if value is not None
-                       and np.isfinite(value) else "")
+            utc = TIME_BASE.to_utc(sample_host_ns)
+            sequence = self._channel_sample_indices.get(index, 0)
+            self._channel_sample_indices[index] = sequence + 1
+            valid = bool(np.isfinite(value))
+            rows.append(",".join([
+                str(sample_host_ns), f"{TIME_BASE.rel_s(sample_host_ns):.9f}",
+                f"{utc:.6f}" if utc is not None else "",
+                str(self._rows_written + len(rows)), str(index + 1), str(sequence),
+                f"{value:.9g}" if valid else "", "1" if valid else "0"]) + "\n")
         try:
-            self._csv_handle.write(",".join(row) + "\n")
-            self._rows_written += 1
-            self._sweeps += 1
-        except OSError:
-            pass
-        self._row_values = {}
-        self._last_index = -1
+            self._csv_handle.write("".join(rows))
+            self._rows_written += len(rows)
+        except OSError as exc:
+            self.raise_recording_alarm(f"No se pudo escribir el CSV: {exc}")
 
     def _close_chunk(self, reason: str = "") -> None:
-        # Último barrido pendiente: se escribe antes de cerrar el archivo.
-        if self._row_values:
-            self._flush_row(TIME_BASE.now_ns())
         summary: Dict[str, Any] = {"motivo": reason,
                                    "filas_csv": self._rows_written}
         if self._csv_handle is not None:
@@ -585,7 +614,19 @@ class FiberWorker(DeviceWorker):
     # ------------------------------------------------------------------
     def _stats_payload(self) -> Dict[str, Any]:
         channels = self.parser.snapshot()
-        values = self.parser.values_array()
+        now_ns = TIME_BASE.now_ns()
+        for channel in channels:
+            state = self.parser.channels[int(channel["indice"])]
+            stale = (now_ns - state.last_host_ns) > 3_000_000_000
+            valid = np.isfinite(state.last_value) and not stale
+            channel["estado"] = ("Sin datos recientes" if stale else
+                                 "Activa" if valid else "Lectura inválida")
+            if not valid:
+                channel["valor"] = None
+            if stale:
+                channel["hz"] = 0.0
+        values = np.array([c["valor"] if c["valor"] is not None else np.nan
+                           for c in channels])
         payload: Dict[str, Any] = {
             "canales": channels,
             "n_canales": len(channels),

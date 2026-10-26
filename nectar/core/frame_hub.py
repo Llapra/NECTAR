@@ -101,7 +101,7 @@ class FrameHub:
             self.skipped += 1
             return False
         # Anclar al reloj para que la tasa no derive si un frame llega tarde.
-        self._next_due = max(now, self._next_due + self._interval)
+        self._next_due = now + self._interval
         return True
 
     # ------------------------------------------------------------------

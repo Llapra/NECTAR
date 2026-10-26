@@ -23,37 +23,10 @@ from .. import theme
 
 try:
     import pyqtgraph as pg
-    # ``useOpenGL`` manda el pintado a la GPU, que es lo que hace que la vista
-    # de la cámara de eventos se sienta fluida a 60 cuadros por segundo. El
-    # visor del programa anterior del laboratorio lo activa, y su ausencia
-    # acá era una de las diferencias visibles de la versión 1.0.0.
-    #
-    # Depende de PyOpenGL, que es opcional: si falta, pyqtgraph puede fallar
-    # al dibujar (no al configurarse), y el error aparecería recién con la
-    # primera imagen. Así que se comprueba el import ahora y solo se activa
-    # si está, cayendo al pintado por CPU en silencio si no.
-    try:
-        import OpenGL                                   # noqa: F401
-        HAS_OPENGL = True
-    except Exception:
-        HAS_OPENGL = False
-    pg.setConfigOptions(imageAxisOrder="row-major", antialias=False,
-                        useOpenGL=HAS_OPENGL)
+    pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
     HAS_PYQTGRAPH = True
 except Exception:       # pyqtgraph ausente o sin backend
     HAS_PYQTGRAPH = False
-    HAS_OPENGL = False
-
-
-def aceleracion_estado() -> str:
-    """Qué se está usando para pintar. Lo informa ``--check``."""
-    if not HAS_PYQTGRAPH:
-        return ("pyqtgraph no disponible: vista previa por QPainter "
-                "(funciona, pero sin ROI arrastrable ni aceleración)")
-    if HAS_OPENGL:
-        return "pyqtgraph con OpenGL (pintado por GPU)"
-    return ("pyqtgraph sin OpenGL (pintado por CPU). Para la vista fluida de "
-            "la cámara de eventos: pip install PyOpenGL")
 
 
 def _to_qimage(array: np.ndarray) -> Optional[QImage]:

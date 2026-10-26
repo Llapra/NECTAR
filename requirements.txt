@@ -30,12 +30,6 @@ numba>=0.58
 # --- visualización ---------------------------------------------------------
 # Visores de imagen con ROI arrastrable y gráficos en vivo.
 pyqtgraph>=0.13.3
-# Pintado por GPU de la vista de la cámara de eventos (pyqtgraph lo usa con
-# useOpenGL=True). Es opcional en el sentido de que el programa arranca sin
-# él, pero sin OpenGL la vista en vivo se pinta con la CPU y a 60 cuadros por
-# segundo se nota. Con él, la vista queda como la del visor anterior del
-# laboratorio.
-PyOpenGL>=3.1.6
 # Gráficos de análisis (conversor IMU y topografía).
 matplotlib>=3.7
 # Grabación del video de la reconstrucción.
@@ -45,19 +39,10 @@ matplotlib>=3.7
 # pip no la reemplaza.
 opencv-python>=4.5
 
-# --- dependencias internas del SDK de Metavision ---------------------------
-# ATENCIÓN: esto NO lo usa NECTAR. Lo importa `metavision_core.event_io` por
-# dentro, para los archivos HDF5 de eventos. Va aquí porque el SDK se instala
-# fuera de pip (ver el final de este archivo) y su lista de requisitos de
-# Python no se arrastra sola: si falta h5py, el import de
-# `metavision_core.event_io` falla con ModuleNotFoundError y el programa
-# informaba "el SDK de Metavision no está disponible" con el SDK instalado y
-# la cámara enchufada. Costó una sesión entera de depuración; queda escrito
-# para que no vuelva a pasar.
-#
-# Si instalaste OpenEB por apt, lo más limpio es instalar su propia lista:
-#     pip install -r /usr/share/metavision/python_requirements/requirements_openeb.txt
-# Este renglón es el mínimo para que el SDK importe.
+# --- SDK de la cámara de eventos -------------------------------------------
+# Metavision para Windows no instala sus dependencias de Python, y
+# metavision_core.event_io importa h5py al cargarse: sin él la cámara de
+# eventos no se detecta aunque el SDK esté instalado.
 h5py>=3.8
 
 # --- hardware --------------------------------------------------------------
@@ -89,10 +74,9 @@ shapely>=2.0
 #     plugin de CenturyArks. Provee metavision_core, metavision_hal y
 #     metavision_sdk_core.
 #       - Ubuntu 24.04: paquete apt `metavision-openeb` (5.3) + plugin
-#         SilkyEvCam v5.2.0. El entorno virtual lo crea
-#         `bash instalar_venv.sh`, que instala ANTES de este archivo
+#         SilkyEvCam v5.2.0. El entorno virtual se crea con
+#         --system-site-packages y ANTES de este archivo se instala
 #         /usr/share/metavision/python_requirements/requirements_openeb.txt
-#         (si existe) y enlaza el SDK al entorno con un archivo .pth.
 #       - Windows: instalador de Metavision + plugin de CenturyArks.
 #     Sin él, las cámaras de eventos solo funcionan en modo simulado.
 #

@@ -280,6 +280,19 @@ class GlobalRecorder(QObject):
         # ---------------- Fase 1: verificación --------------------------
         self._set_phase(PHASE_VERIFY, "Comprobando dispositivos y destino")
         candidates = self.candidates()
+        from .device_registry import REGISTRY
+        unavailable = []
+        for worker in self._workers.values():
+            device_type = REGISTRY.get(worker.family)
+            if (worker.include_in_session and
+                    (device_type is None or device_type.recordable) and
+                    worker not in candidates):
+                unavailable.append(worker.display_name)
+        if unavailable:
+            self._set_phase(PHASE_IDLE, "")
+            self.failed.emit("No están listos para grabar: " + ", ".join(unavailable)
+                             + ". Comprueba que reciben datos o exclúyelos de la sesión.")
+            return False
         if not candidates:
             self._set_phase(PHASE_IDLE, "")
             self.failed.emit("Ningún dispositivo listo: no hay nada que grabar.")

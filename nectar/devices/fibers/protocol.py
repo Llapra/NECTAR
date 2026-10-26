@@ -7,9 +7,10 @@ es el que interroga ópticamente cada sonda y publica las temperaturas ya
 convertidas. El PC habla con ese equipo por Ethernet, con **dos canales
 separados**:
 
-* un canal de **control** en ASCII, con comandos tipo SCPI (``measure:start``,
-  ``system0101:samplingrate 1000``…), donde se configura y se arranca;
-* un canal de **datos**, por donde el equipo empuja las muestras en binario.
+* un canal de **control** en ASCII (2001), con ``measure:start`` y
+  ``rate 0.001`` (período en segundos para 1 kHz);
+* un canal de **datos** (2003), que pide ``Key?:``. Se responde con la clave
+  anunciada al abrir control (``Key:2`` en el equipo del laboratorio).
 
 Formato de cada muestra (8 bytes, tal como lo decodificaba el cliente en C++
 del laboratorio)::
@@ -34,9 +35,10 @@ discreto y el tope depende del módulo instalado. Eso es lo que valida
 máximo legal y se avisa, en vez de mandar un comando que el equipo va a
 rechazar en silencio.
 
-Un chasis de 4U acepta 1 a 13 módulos (2 a 26 canales) y, en configuración
-multi-chasis por EtherCAT, hasta 1300 canales. NECTAR no asume un número fijo:
-descubre qué canales están publicando y crea una fila por cada uno.
+El equipo del laboratorio publica tres módulos de dos canales (seis fibras).
+La frecuencia aplicada se confirma mediante ``rate?``; no se supone que un
+comando enviado haya sido aceptado. Los comandos de módulo que se conservan
+abajo no se usan para configurar este CoreSens2.
 """
 
 from __future__ import annotations
@@ -79,6 +81,17 @@ def cmd_sampling_rate(hz: int, system: int = 1, module: int = 1) -> bytes:
 def cmd_master_rate(hz: int) -> bytes:
     """Limita la tasa de publicación del maestro hacia el PC."""
     return f"systems:measure:rate {int(hz)}\n".encode()
+
+
+def cmd_rate(hz: int) -> bytes:
+    """CoreSens2: el comando rate recibe el período en segundos."""
+    if hz <= 0:
+        raise ValueError("La frecuencia debe ser positiva")
+    return f"rate {1.0 / hz:.9g}\n".encode("ascii")
+
+
+def cmd_rate_query() -> bytes:
+    return b"rate?\n"
 
 
 def cmd_status() -> bytes:
