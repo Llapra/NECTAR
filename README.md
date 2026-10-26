@@ -8,7 +8,7 @@ proyecto **PASTAM** (*Passive Sensor Tracking and Analysis*), financiado por
 
 **Autor:** Eduardo Llantén · Instituto de Física, Pontificia Universidad Católica de Valparaíso.
 
-**Versión:** 1.0.0 · [registro de cambios](CHANGELOG.md)
+**Versión:** 1.0.2 · [registro de cambios](CHANGELOG.md)
 
 ---
 
@@ -162,33 +162,60 @@ está hecho para esta versión. Por eso se congelan:
 sudo apt-mark hold $(dpkg -l | awk '/^ii/ && /metavision/ {print $2}')
 ```
 
-**3. Entorno virtual `venv-NECTAR`** (dentro de la carpeta del programa).
-
-Se crea con `--system-site-packages` para que el entorno **vea** los módulos de
-Metavision instalados en el sistema. Sin esa opción, NECTAR no encuentra la
-cámara de eventos.
+**3. Entorno virtual `venv-NECTAR` y librerías de Python** (dentro de la
+carpeta del programa). Lo hace un script, en una sola línea:
 
 ```bash
-python3 -m venv ~/Codigos/NECTAR/venv-NECTAR --system-site-packages
-echo 'export PYTHONNOUSERSITE=true' >> ~/.bashrc
-source ~/.bashrc
-source ~/Codigos/NECTAR/venv-NECTAR/bin/activate
-python -m pip install --upgrade pip
+bash instalar_venv.sh
 ```
 
-**4. Librerías de Python.** Primero las que pide OpenEB y después las de
-NECTAR, en ese orden, para que pip respete las versiones que fija OpenEB:
+El script no usa `sudo` y no borra nada. Hace esto, en orden:
+
+1. Busca dónde quedó instalado el SDK de Metavision (con `apt` queda en
+   `/usr/lib/python3/dist-packages`; compilado a mano, en
+   `/usr/local/lib/python3.12/dist-packages`) y **con qué versión de Python fue
+   compilado**, que se lee en el nombre de `metavision_hal.cpython-312-….so`.
+   El entorno tiene que ser de esa misma versión, o el SDK no importa.
+2. Crea `venv-NECTAR` con esa versión de Python. Si ya existe, lo reutiliza.
+3. Instala las librerías: primero las que pide OpenEB
+   (`/usr/share/metavision/python_requirements/requirements_openeb.txt`, si
+   existe) y después `requirements.txt`, en ese orden, para que pip respete las
+   versiones que fija OpenEB.
+4. Le enseña al entorno dónde está el SDK con un archivo de una línea,
+   `venv-NECTAR/lib/python3.12/site-packages/metavision.pth`. Python agrega esa
+   carpeta **al final** de su camino, así que lo instalado dentro del entorno
+   siempre tiene prioridad y del sistema solo se toma el SDK.
+5. Comprueba que el SDK importa y que el HAL ve la cámara, **sin abrirla**.
+6. Corre `python main.py --check`.
+
+Por qué un `.pth` y no `--system-site-packages`: esa opción hace visible todo
+lo instalado en el Python del sistema, y si el sistema tiene, por ejemplo, un
+`numpy` de `apt`, pip lo da por bueno y no instala el del entorno. Con el
+`.pth` el entorno queda completo por sí mismo y solo toma prestado el SDK. El
+resultado sirve igual para NECTAR, para `main_v14.1.py` y para los programas de
+prueba.
+
+`venv-NECTAR/` está en `.gitignore`: nunca se sube a GitHub, y cada PC crea el
+suyo con el script.
+
+**4. Usar el entorno.** Cada vez que se abre una terminal nueva:
 
 ```bash
-python -m pip install -r /usr/share/metavision/python_requirements/requirements_openeb.txt
-python -m pip install -r requirements.txt
+cd ~/Codigos/NECTAR
+source venv-NECTAR/bin/activate
+python main.py
 ```
 
-**5. Comprobar.**
+En VS Code: `Ctrl+Shift+P` → *Python: Select Interpreter* → elegir
+`venv-NECTAR/bin/python`.
+
+**5. Comprobar la cámara de eventos sin NECTAR.** `probar_evcam.py` es un
+banco de pruebas independiente: abre solo la cámara de eventos, muestra la vista
+en vivo, mide el desfase frente al reloj de pared y escribe un registro en
+`probar_evcam_registro.txt` que sobrevive aunque el programa se cierre de golpe.
 
 ```bash
-python -c "import metavision_core, metavision_hal, metavision_sdk_core; print('Metavision OK')"
-python main.py --check
+python probar_evcam.py
 ```
 
 Con la SilkyEvCam conectada a un puerto USB 3.0, `silkyevcam_platform_info`

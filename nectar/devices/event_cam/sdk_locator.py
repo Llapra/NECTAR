@@ -88,13 +88,75 @@ def find_sdk_dir() -> Optional[Path]:
     return None
 
 
+#: Paquetes de pip que el SDK necesita por dentro y que NECTAR no usa
+#: directamente. Van acá porque su ausencia se manifiesta como un
+#: ``ModuleNotFoundError`` dentro del SDK, que es muy fácil de leer como "no
+#: está el SDK" cuando el SDK sí está.
+DEPENDENCIAS_DEL_SDK = {
+    "h5py": ("metavision_core.event_io lo importa para leer y escribir "
+             "archivos HDF5 de eventos"),
+    "scipy": "varios módulos de metavision_core lo usan para filtrado",
+    "cv2": ("algunos módulos del SDK lo usan para mostrar imágenes "
+            "(paquete de pip: opencv-python)"),
+    "pandas": "metavision_core lo usa para los resúmenes de eventos",
+}
+
+#: Nombre del módulo → nombre del paquete de pip, cuando no coinciden.
+PAQUETE_PIP = {"cv2": "opencv-python"}
+
+
 def _try_import() -> Tuple[bool, str]:
-    try:
-        import metavision_core.event_io          # noqa: F401
-        import metavision_hal                    # noqa: F401
+    """Importa los dos módulos del SDK **por separado**.
+
+    La versión anterior los importaba juntos en un mismo ``try``, así que
+    cualquier fallo producía el mismo mensaje genérico. Eso costó una sesión
+    entera de depuración: faltaba ``h5py`` —una dependencia interna de
+    ``metavision_core.event_io``, no de NECTAR— y el programa informaba "el
+    SDK de Metavision no está disponible" con el SDK perfectamente instalado.
+
+    Ahora cada módulo se reporta por su nombre y el error se devuelve tal
+    como vino, para que ``diagnose()`` pueda distinguir los casos.
+    """
+    fallos = []
+    for nombre in ("metavision_hal", "metavision_core.event_io"):
+        try:
+            __import__(nombre)
+        except Exception as exc:
+            fallos.append(f"{nombre}: {type(exc).__name__}: {exc}")
+    if not fallos:
         return True, ""
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+    return False, " | ".join(fallos)
+
+
+def _missing_dependency(error: str) -> Optional[str]:
+    """Módulo faltante que el error delata, si es una dependencia del SDK.
+
+    Busca el nombre entre comillas de un ``ModuleNotFoundError``. Si el módulo
+    que falta es uno de los que el SDK necesita por dentro, lo devuelve; si el
+    que falta es el propio SDK, no, porque ése es un caso distinto.
+    """
+    if "ModuleNotFoundError" not in error and "No module named" not in error:
+        return None
+    for nombre in DEPENDENCIAS_DEL_SDK:
+        if f"'{nombre}'" in error or f"named {nombre}" in error:
+            return nombre
+    return None
+
+
+def dependency_hint(error: str) -> str:
+    """Instrucción concreta para una dependencia interna del SDK que falta."""
+    modulo = _missing_dependency(error)
+    if modulo is None:
+        return ""
+    paquete = PAQUETE_PIP.get(modulo, modulo)
+    motivo = DEPENDENCIAS_DEL_SDK[modulo]
+    return (
+        f"El SDK de Metavision **sí está instalado y visible**, pero le falta "
+        f"una dependencia interna: el módulo '{modulo}'.\n"
+        f"No es un paquete de NECTAR: {motivo}.\n"
+        f"Con el entorno virtual activado:\n"
+        f"    pip install {paquete}\n"
+        f"y vuelve a arrancar el programa.")
 
 
 def ensure_on_path() -> Tuple[bool, str, Optional[Path]]:
@@ -123,9 +185,14 @@ def ensure_on_path() -> Tuple[bool, str, Optional[Path]]:
 def diagnose() -> str:
     """Explicación en castellano de por qué el SDK no está disponible.
 
-    Distingue los tres casos que en la práctica se confunden: el SDK no está
-    instalado, está instalado pero este intérprete no lo ve, y está instalado y
-    visible pero compilado para otra versión de Python.
+    Distingue los cuatro casos que en la práctica se confunden:
+
+    1. el SDK no está instalado;
+    2. está instalado pero este intérprete no lo ve (el caso del entorno
+       virtual sin acceso a los paquetes del sistema);
+    3. está instalado y visible pero le falta una dependencia interna, por
+       ejemplo ``h5py`` — el caso que hizo perder una sesión entera;
+    4. está instalado y visible pero compilado para otra versión de Python.
     """
     ok, error, added = ensure_on_path()
     if ok and added is not None:
@@ -133,6 +200,12 @@ def diagnose() -> str:
                 f"camino de este intérprete.")
     if ok:
         return "SDK de Metavision disponible."
+
+    # Caso 3 antes que los demás: si lo que falta es una dependencia interna,
+    # hablar de rutas y de entornos virtuales solo desorienta.
+    pista = dependency_hint(error)
+    if pista:
+        return f"{pista}\nIntérprete: {sys.executable}\nError: {error}"
 
     sdk_dir = find_sdk_dir()
     interpreter = sys.executable
@@ -162,9 +235,8 @@ def diagnose() -> str:
             "sistema, que es la causa habitual. La solución menos invasiva es "
             "añadir la carpeta del SDK al entorno con un archivo .pth:\n"
             f"    echo {sdk_dir} > {site}/metavision.pth\n"
-            "y volver a arrancar el programa. (La alternativa es rehacer el "
-            "entorno con: python3 -m venv --system-site-packages .venv, pero "
-            "eso obliga a reinstalar las dependencias.)")
+            "y volver a arrancar el programa. (Lo mismo, y todo lo demás, "
+            "lo hace: bash instalar_venv.sh)")
     else:
         mensaje.append(
             "La carpeta existe pero el import falla igual. Suele significar "

@@ -163,6 +163,12 @@ class EventCamPanel(DevicePanel):
 
     def on_preview(self, image) -> None:
         self.visor.set_image(image)
+        # Acuse de recibo: recién ahora el worker puede pintar el cuadro
+        # siguiente. Es lo que impide que la vista se atrase respecto de la
+        # realidad cuando la pantalla va más lenta que la cámara (ver
+        # ``FrameHub``). Si este acuse se perdiera, el buzón tiene una válvula
+        # de 1 s para no congelar la vista.
+        self.worker.hub.acknowledge()
 
 
 class EvCamTab(FamilyTab):

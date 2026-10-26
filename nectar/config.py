@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "NECTAR"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 APP_SUBTITLE = "Neuromorphic & Emergent Camera Tomography for Atmospheric Research"
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,11 @@ EVENT_BIAS_RANGES = {
 
 EVENT_ACCUM_US_DEFAULT = 10000      # ventana de integración Δt
 EVENT_ACCUM_US_RANGE = (200, 100000)
-EVENT_DISPLAY_FPS_DEFAULT = 20
+#: Cuadros por segundo de la **pantalla**, no de la adquisición: el flujo de
+#: eventos no se toca, esto solo decide cada cuánto se pinta una imagen. 60
+#: es el valor del visor anterior del laboratorio, y es el que hace que el
+#: movimiento se vea continuo al enfocar a mano.
+EVENT_DISPLAY_FPS_DEFAULT = 60
 EVENT_DISPLAY_FPS_RANGE = (1, 200)
 EVENT_SENSOR_SIZE = (640, 480)      # se corrige al conectar con el HAL real
 EVENT_SYNC_MODES = ["STANDALONE", "MASTER", "SLAVE"]

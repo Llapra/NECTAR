@@ -7,7 +7,12 @@
 venv-NECTAR/
 venv*/
 .venv/
+.venv*/
 env/
+
+# --- Registros de los programas de prueba ---------------------------------
+# Los escribe probar_evcam.py en cada corrida; son de la máquina, no del código.
+probar_evcam_registro.txt
 
 # --- Archivos generados por Python ----------------------------------------
 __pycache__/

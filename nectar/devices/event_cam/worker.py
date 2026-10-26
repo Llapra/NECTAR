@@ -53,7 +53,7 @@ from ...core.disk_stream import ByteStreamWriter
 from ...core.frame_hub import FrameHub
 from ...core.time_sync import TIME_BASE
 from ..base import DeviceState, DeviceWorker
-from . import sdk_locator
+from . import hal, sdk_locator
 from .biases import SHARED_BIASES, BiasSet
 from .focus_worker import FocusComputer
 from .roi import EventRoi, apply_event_roi, clamp_window, disable_event_roi
@@ -68,17 +68,21 @@ from .simulation import EventSimulator, SimConfig
 # "no está el SDK" signifique de verdad que no está y no "está pero este
 # intérprete no lo ve".
 _SDK_OK, _SDK_ERROR, _SDK_DIR = sdk_locator.ensure_on_path()
-if _SDK_OK:
-    from metavision_core.event_io import EventsIterator      # type: ignore
-    from metavision_hal import DeviceDiscovery               # type: ignore
-    HAS_METAVISION = True
-else:
-    HAS_METAVISION = False
+HAS_METAVISION = _SDK_OK
 
 
 def metavision_status() -> str:
-    """Diagnóstico legible del estado del SDK. Lo usa ``--check``."""
-    return sdk_locator.diagnose()
+    """Diagnóstico legible del estado del SDK. Lo usa ``--check``.
+
+    Cuando el SDK está disponible se agrega el informe del listado, porque la
+    pregunta que de verdad importa no es "¿está el SDK?" sino "¿ve el HAL la
+    cámara que tengo enchufada?", y esas dos cosas se confundieron una vez.
+    """
+    diagnostico = sdk_locator.diagnose()
+    if not HAS_METAVISION:
+        return diagnostico
+    return (f"{diagnostico}\n"
+            f"Listado de cámaras según el HAL:\n{hal.listing_report()}")
 
 
 def metavision_sdk_dir():
@@ -106,14 +110,58 @@ def discover_event_cams() -> List[Dict[str, Any]]:
     if not HAS_METAVISION:
         raise RuntimeError(sdk_locator.diagnose())
 
-    serials = list(DeviceDiscovery.list_serial_numbers())
+    # Buscar NO abre ninguna cámara. Esta función se llama desde varias
+    # pestañas al arrancar (② EvCam, ④ Reconstrucción, ① Adquisición); si
+    # abriera la cámara, la abriría varias veces sin que nadie lo pidiera, que
+    # es una de las causas de la caída de la 1.0.1.
+    try:
+        camaras = hal.list_cameras()
+    except Exception as exc:
+        raise RuntimeError(
+            f"El listado de cámaras del HAL falló: {type(exc).__name__}: "
+            f"{exc}") from exc
+
+    if not camaras:
+        if hal.has_listing():
+            # El listado existe y funciona, y dice que no hay nada: eso es
+            # información, y se dice tal cual.
+            raise RuntimeError(
+                "El SDK de Metavision está disponible, pero no hay ninguna "
+                "cámara de eventos conectada (DeviceDiscovery.list() no "
+                "devuelve nada). Revisa que la cámara esté enchufada y que "
+                "MV_HAL_PLUGIN_PATH apunte a la carpeta de plugins del HAL.")
+        # Esta versión del SDK no sabe listar. Se ofrece "la primera
+        # disponible", igual que hace main_v14.1 en ese caso, pero SIN abrirla
+        # ahora: se abrirá al pulsar CONECTAR, y si no hay cámara el error del
+        # SDK aparecerá en ese momento, completo.
+        return [{
+            "id": "evcam_primera",
+            "label": "EvCam1",
+            "serial": "",
+            "unica": True,
+            "origen_listado": ("esta versión del SDK no lista cámaras: se "
+                               "abrirá la primera disponible"),
+            "modelo": config.EVENT_DEFAULT_MODEL,
+            "simulated": False,
+        }]
+
+    unica = len(camaras) == 1
     return [{
-        "id": f"evcam_{serial}",
+        "id": f"evcam_{info.serial}",
         "label": f"EvCam{index}",
-        "serial": serial,
+        "serial": info.serial,
+        #: Con una sola cámara conectada se abre como "la primera disponible"
+        #: (``input_path=""``), exactamente como main_v14.1, que es la forma
+        #: comprobada en el PC del laboratorio. Con dos o más hace falta el
+        #: número de serie para distinguirlas.
+        "unica": unica,
+        "descriptor_hal": info.raw,
+        "integrador": info.integrator,
+        "plugin": info.plugin,
+        "origen_listado": info.source,
         "modelo": config.EVENT_DEFAULT_MODEL,
         "simulated": False,
-    } for index, serial in enumerate(serials, start=1)]
+    } for index, info in enumerate(camaras, start=1)]
 
 
 class EventCamWorker(DeviceWorker):
@@ -165,6 +213,17 @@ class EventCamWorker(DeviceWorker):
         self._device = None              # dispositivo del HAL
         self._events_stream = None       # ``i_events_stream`` del HAL
         self._biases_facility = None
+        #: Por qué ruta se abrió la cámara (ver ``hal.py``). Se informa en el
+        #: registro y decide si la grabación puede armarse.
+        self._open_route = ""
+        #: ``False`` mientras no se compruebe que el HAL expone el canal que
+        #: escribe el ``.raw``. Se arranca en ``False`` a propósito: creer que
+        #: se puede grabar y descubrir que no en el momento del disparo es el
+        #: peor orden posible para una campaña de observación.
+        self._can_record = False
+        #: Recorte que solo se puede aplicar en la pantalla, cuando el sensor
+        #: no admite ``I_ROI``. ``None`` = cuadro completo. Ver ``_decimate``.
+        self._visual_roi: Optional[tuple] = None
         self._simulator: Optional[EventSimulator] = None
         self._sim_writer: Optional[ByteStreamWriter] = None
         self._focus: Optional[FocusComputer] = None
@@ -432,18 +491,31 @@ class EventCamWorker(DeviceWorker):
                       f"Δt={self.accumulation_time_us} µs)")
             return
 
-        self._iterator = EventsIterator(input_path=self.serial or "",
-                                        delta_t=self.accumulation_time_us)
-        # El HAL cuelga del reader del iterador; el nombre del atributo cambió
-        # entre versiones del SDK, así que se prueban las dos formas.
-        device = None
-        for attribute in ("reader", "_reader"):
-            reader = getattr(self._iterator, attribute, None)
-            if reader is not None:
-                device = getattr(reader, "device", None)
-                if device is not None:
-                    break
-        self._device = device
+        # Una sola llamada al SDK, como main_v14.1. Con una sola cámara
+        # conectada se usa "la primera disponible" (input_path=""), que es la
+        # forma comprobada en el PC del laboratorio; con dos, el serial.
+        unica = bool(self.descriptor.get("unica", False))
+        input_path = "" if (unica or not self.serial) else self.serial
+        resultado = hal.open_camera(input_path=input_path,
+                                    delta_t_us=self.accumulation_time_us)
+        self._iterator = resultado.iterator
+        self._device = resultado.device
+        self._open_route = resultado.ruta
+        # Se decide de verdad en ``_configure_device``, con la facilidad en la
+        # mano. Sin dispositivo, no hay nada que decidir.
+        self._can_record = False
+
+        self._log(f"Apertura · {resultado.resumen}")
+        for nota in resultado.notas:
+            self._log(f"  {nota}")
+        if self._device is None:
+            # No es fatal: la imagen sirve, y negarse a mostrarla sería peor.
+            # Pero tiene que quedar dicho, porque esta cámara NO puede grabar
+            # y el usuario se enteraría sólo al disparar.
+            self._log("AVISO: con esta versión del SDK la cámara no podrá "
+                      "grabar ni recibir los biases. La vista en vivo "
+                      "funciona igual que en main_v14.1.")
+        device = self._device
         try:
             geometry = self._iterator.get_size()
             if geometry:
@@ -492,6 +564,13 @@ class EventCamWorker(DeviceWorker):
         except Exception as exc:
             self._events_stream = None
             self._log(f"Sin canal de grabación cruda: {exc}")
+        # La verdad sobre si se puede grabar es ésta, no la sonda de ``hal``:
+        # aquí tenemos la facilidad en la mano.
+        self._can_record = self._events_stream is not None
+        if not self._can_record:
+            self._log("AVISO: el HAL no expone i_events_stream en esta "
+                      "cámara. La vista en vivo funciona, pero la grabación "
+                      "no se podrá armar.")
 
         # --- identificación del equipo ---------------------------------
         # El número de serie no siempre se puede leer en estas cámaras. Eso no
@@ -547,19 +626,47 @@ class EventCamWorker(DeviceWorker):
             self._log(f"ROI del simulador: {width}x{height} en ({x},{y})")
             return
         if self._device is None:
-            self._log("No hay dispositivo HAL: el ROI no se puede aplicar.")
+            # Sin dispositivo del HAL no hay recorte en el sensor, pero sí se
+            # puede encuadrar en pantalla, que es lo que hace main_v14.1.
+            x, y, width, height = clamp_window(x, y, width, height,
+                                               self.width, self.height)
+            self.roi = EventRoi(x=x, y=y, width=width, height=height,
+                                enabled=True, sensor_width=self.width,
+                                sensor_height=self.height, applied=False,
+                                error="sin dispositivo del HAL")
+            self._fallback_visual_roi(self.roi)
             return
         result = apply_event_roi(self._device, x, y, width, height,
                                  self.width, self.height)
         self.roi = result
         if result.applied:
+            self._visual_roi = None
             self._log(f"ROI activo en el sensor: {result.width}x{result.height} "
                       f"en ({result.x},{result.y}) · {result.method} · "
                       f"{result.pixel_fraction * 100:.1f}% de los píxeles")
         else:
-            self._fail(f"El ROI NO se aplicó en el sensor: {result.error}. "
-                       f"La grabación seguiría con el cuadro completo.",
-                       fatal=False)
+            self._fallback_visual_roi(result)
+
+    def _fallback_visual_roi(self, result) -> None:
+        """Recorte solo en la pantalla, cuando el sensor no admite ``I_ROI``.
+
+        Es exactamente lo que hacía la versión vieja del programa, y por eso
+        hay que decir con claridad lo que **no** hace: el sensor sigue
+        disparando en todo el cuadro, el USB sigue cargado igual y el ``.raw``
+        grabado contiene el cuadro completo. Solo sirve para encuadrar a ojo.
+
+        Se deja como respaldo en vez de dejar al usuario sin recorte visible,
+        pero no se descuenta del caudal esperado (ver ``pixel_fraction``) y
+        queda escrito en el ``_meta.json`` con ``aplicado_en_hardware: false``,
+        para que nadie analice ese archivo creyendo que está recortado.
+        """
+        self._visual_roi = (result.x, result.y, result.width, result.height)
+        self._log(
+            f"El recorte NO se pudo programar en el sensor: {result.error}. "
+            f"Queda como recorte SOLO VISUAL de {result.width}x{result.height} "
+            f"en ({result.x},{result.y}): sirve para encuadrar, pero el sensor "
+            f"sigue disparando en todo el cuadro, el caudal no baja y el .raw "
+            f"se graba completo. Queda anotado así en el _meta.json.")
 
     def _clear_roi_now(self) -> None:
         if self.simulated:
@@ -571,6 +678,11 @@ class EventCamWorker(DeviceWorker):
                 self._simulator.clear_roi()
         elif self._device is not None:
             self.roi = disable_event_roi(self._device, self.width, self.height)
+        else:
+            self.roi = EventRoi(x=0, y=0, width=self.width, height=self.height,
+                                enabled=False, sensor_width=self.width,
+                                sensor_height=self.height, applied=True)
+        self._visual_roi = None
         self._log("ROI desactivado: cuadro completo.")
 
     def _service_roi(self) -> None:
@@ -585,10 +697,17 @@ class EventCamWorker(DeviceWorker):
 
     def _close_source(self) -> None:
         self._finish_recording(reason="cierre_de_stream")
-        self._iterator = None
-        self._device = None
+        # Se sueltan las referencias y nada más, como main_v14.1. No se llama
+        # a ningún método de cierre del iterador ni del dispositivo: el
+        # dispositivo es del iterador, y el SDK libera la cámara cuando el
+        # iterador deja de existir. Llamar métodos de objetos nativos por si
+        # acaso es justo el tipo de cosa que puede terminar en una violación
+        # de segmento.
         self._events_stream = None
         self._biases_facility = None
+        self._device = None
+        self._iterator = None
+        self._can_record = False
 
     # ------------------------------------------------------------------
     def _iterate(self):
@@ -646,6 +765,13 @@ class EventCamWorker(DeviceWorker):
                 visual.fill(0)
                 if sample.size:
                     render_events(visual, sample["x"], sample["y"], sample["p"])
+                # Contrapresión, como la bandera ``gui_ready`` de main_v14.1:
+                # no se pinta el cuadro siguiente hasta que la interfaz acusa
+                # recibo de éste (``EventCamPanel.on_preview``). Sin esto, si
+                # la pantalla pinta más lento que 60 cuadros por segundo, las
+                # señales se encolan en Qt y lo que se ve se va atrasando
+                # respecto de la realidad. La 1.0.0 y la 1.0.1 no lo tenían.
+                self.hub.hold()
                 self.preview_ready.emit(visual.copy())
 
             # ---------------- enfoque: solo una copia ------------------
@@ -674,33 +800,69 @@ class EventCamWorker(DeviceWorker):
         """Submuestrea para la pantalla.
 
         A 20 MEv/s no tiene sentido pintar todos los eventos: con ~10 000 por
-        cuadro la imagen ya es la misma y el costo baja tres órdenes. Ya no se
-        filtra por ROI acá: si hay recorte, los eventos de fuera directamente
-        no existen porque el sensor no los generó.
+        cuadro la imagen ya es la misma y el costo baja tres órdenes.
+
+        Normalmente no hay que filtrar por ROI acá: cuando el recorte está en
+        el sensor, los eventos de fuera directamente no existen. El filtrado
+        reaparece solo cuando el sensor no admite ``I_ROI`` y el recorte quedó
+        como ayuda visual (ver ``_fallback_visual_roi``); en ese caso se filtra
+        **después** de diezmar, para no pagar la máscara sobre el bloque
+        completo.
         """
         step = max(1, len(events) // 10000)
-        return events[::step]
+        sample = events[::step]
+        window = self._visual_roi
+        if window is None or sample.size == 0:
+            return sample
+        x, y, width, height = window
+        inside = ((sample["x"] >= x) & (sample["x"] < x + width)
+                  & (sample["y"] >= y) & (sample["y"] < y + height))
+        return sample[inside]
 
     # ------------------------------------------------------------------
     # Grabación
     # ------------------------------------------------------------------
+    def _service_arm_request(self) -> None:
+        """Arma la grabación, o se niega explicando por qué no puede.
+
+        La comprobación de si la cámara puede grabar va **aquí**, al armar, y
+        no en el disparo. Armar es el momento en que todavía se puede hacer
+        algo: cambiar de puerto USB, reenchufar la cámara, revisar el plugin
+        del HAL. Descubrirlo en el disparo es descubrirlo cuando la ventana de
+        observación ya se perdió, y en el VLT no hay segunda noche.
+        """
+        if not self.simulated and not self._can_record:
+            self._armed = False
+            self._fail(
+                "Esta cámara NO puede grabar: el HAL no expone el canal "
+                "i_events_stream, que es lo único capaz de escribir el .raw. "
+                f"Ruta de apertura: '{self._open_route or '?'}'. La vista en "
+                "vivo sigue funcionando. En el registro de esta pestaña están "
+                "los intentos de apertura que se hicieron; esto suele "
+                "arreglarse con otro puerto USB 3 o reenchufando la cámara.",
+                fatal=False)
+            return
+
+        target = self.record_target
+        try:
+            Path(target["directory"]).mkdir(parents=True, exist_ok=True)
+            self._chunk_index = 0
+            self._chunk_summaries = []
+            self._write_failure = ""
+            self._armed = True
+            self._set_state(DeviceState.ARMED)
+            modo = ("un solo archivo" if not target["chunk_duration_s"]
+                    else f"bloques de "
+                         f"{target['chunk_duration_s'] / 60:.0f} min")
+            self._log(f"Armada · {modo} · carpeta lista.")
+        except Exception as exc:
+            self._fail(f"No se pudo armar: {exc}")
+
+    # ------------------------------------------------------------------
     def _service_recording(self, events, now: float, host_ns: int) -> None:
         # --- armado ----------------------------------------------------
         if self._consume_arm_request():
-            target = self.record_target
-            try:
-                Path(target["directory"]).mkdir(parents=True, exist_ok=True)
-                self._chunk_index = 0
-                self._chunk_summaries = []
-                self._write_failure = ""
-                self._armed = True
-                self._set_state(DeviceState.ARMED)
-                modo = ("un solo archivo" if not target["chunk_duration_s"]
-                        else f"bloques de "
-                             f"{target['chunk_duration_s'] / 60:.0f} min")
-                self._log(f"Armada · {modo} · carpeta lista.")
-            except Exception as exc:
-                self._fail(f"No se pudo armar: {exc}")
+            self._service_arm_request()
 
         if self._consume_arm_cancel():
             self._armed = False
@@ -950,7 +1112,10 @@ class EventCamWorker(DeviceWorker):
             "modelo": self.model,
             "roi": self.roi.rect if self.roi.enabled else None,
             "roi_en_hardware": self.roi.applied and self.roi.enabled,
+            "roi_solo_visual": self._visual_roi is not None,
             "roi_fraccion": round(self.roi.pixel_fraction, 3),
+            "ruta_apertura": self._open_route,
+            "puede_grabar": self.simulated or self._can_record,
             "sync": self.sync_mode,
             "ancho": self.width,
             "alto": self.height,

@@ -124,6 +124,12 @@ def check_dependencies() -> int:
     optional = [
         ("numba", "compilación JIT del renderizado de eventos", False),
         ("pyqtgraph", "visores e imágenes aceleradas, gráficos en vivo", False),
+        ("OpenGL", "pintado por GPU de la vista en vivo (PyOpenGL)", False),
+        # No lo usa NECTAR: lo importa metavision_core.event_io por dentro.
+        # Se lista aquí porque su ausencia se manifiesta como "el SDK de
+        # Metavision no está disponible", que es un diagnóstico equivocado.
+        ("h5py", "dependencia INTERNA del SDK de Metavision, no de NECTAR",
+         False),
         ("cv2", "grabación de video de la reconstrucción (opencv-python)", False),
         ("matplotlib", "gráficos de análisis y topografía", False),
         ("serial", "puertos serie del IMU y del anemómetro (pyserial)", False),
@@ -139,6 +145,27 @@ def check_dependencies() -> int:
     ]
 
     print(f"\nNECTAR · comprobación de dependencias\n{'=' * 52}")
+    # Qué intérprete se está usando. Correr NECTAR con un entorno virtual
+    # distinto del suyo es un error fácil de cometer y difícil de ver, porque
+    # el síntoma ("no está el SDK") parece un problema de la instalación.
+    en_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    print(f"Intérprete: {sys.executable}")
+    print(f"Entorno virtual: {sys.prefix if en_venv else 'ninguno (Python del sistema)'}")
+    propio = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "venv-NECTAR")
+    if en_venv and os.path.realpath(sys.prefix) != os.path.realpath(propio):
+        print(f"  Aviso: no es el entorno de esta carpeta ({propio}).")
+
+    # El SDK de Metavision se instala fuera de pip y NECTAR agrega su carpeta
+    # al camino al arrancar. Se hace aquí ANTES de la lista de dependencias:
+    # sin esto, la lista decía "✖ metavision_core" y tres renglones más abajo
+    # "SDK de Metavision disponible", que es contradictorio y confunde.
+    try:
+        from nectar.devices.event_cam import sdk_locator as _locator
+        _locator.ensure_on_path()
+    except Exception:
+        pass
+
     missing_required = []
     for group, title in ((required, "OBLIGATORIAS"), (optional, "OPCIONALES")):
         print(f"\n{title}")
@@ -155,9 +182,13 @@ def check_dependencies() -> int:
     # --- diagnóstico de los SDK, que no se instalan con pip -----------
     print(f"\n{'=' * 52}\nSDK DE LAS CÁMARAS")
     try:
-        from nectar.devices.event_cam import sdk_locator
+        # Se usa ``metavision_status()`` y no ``sdk_locator.diagnose()`` a
+        # secas porque la pregunta que importa no es "¿está el SDK?" sino
+        # "¿ve el HAL la cámara que tengo enchufada?". El primero agrega el
+        # listado del HAL, que es donde se ve la diferencia.
+        from nectar.devices.event_cam.worker import metavision_status
         print("\n  Metavision (cámara de eventos):")
-        for line in sdk_locator.diagnose().splitlines():
+        for line in metavision_status().splitlines():
             print(f"    {line}")
     except Exception as exc:
         print(f"    no se pudo diagnosticar: {exc}")
@@ -173,6 +204,14 @@ def check_dependencies() -> int:
                 print(f"    {line}")
     except Exception as exc:
         print(f"    no se pudo diagnosticar: {exc}")
+
+    # --- cómo se va a pintar la vista en vivo --------------------------
+    print(f"\n{'=' * 52}\nVISTA EN VIVO")
+    try:
+        from nectar.ui.widgets.image_view import aceleracion_estado
+        print(f"    {aceleracion_estado()}")
+    except Exception as exc:
+        print(f"    no se pudo determinar: {exc}")
 
     # --- puertos serie -------------------------------------------------
     print(f"\n{'=' * 52}\nPUERTOS SERIE")
